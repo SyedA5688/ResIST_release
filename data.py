@@ -161,6 +161,7 @@ def get_cifar10_loaders(valid=False):
 def get_cifar100_loaders(valid=False):
     means = [0.507, 0.487, 0.441]
     stds = [0.267, 0.256, 0.276]
+    num_workers = 0
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -177,11 +178,11 @@ def get_cifar100_loaders(valid=False):
         trainset = torchvision.datasets.CIFAR100(
                 root='./data', train=True, download=True, transform=transform_train)
         trn_dl = torch.utils.data.DataLoader(
-                trainset, batch_size=128, shuffle=True, num_workers=1)
+                trainset, batch_size=128, shuffle=True, num_workers=num_workers)
         testset = torchvision.datasets.CIFAR100(
                 root='./data', train=False, download=True, transform=transform_test)
         test_dl = torch.utils.data.DataLoader(
-                testset, batch_size=100, shuffle=False, num_workers=1)
+                testset, batch_size=100, shuffle=False, num_workers=num_workers)
         return trn_dl, test_dl
     else:
         # load the dataset
@@ -200,10 +201,10 @@ def get_cifar100_loaders(valid=False):
         valid_sampler = SubsetRandomSampler(valid_idx)
         trn_dl = torch.utils.data.DataLoader(
             trainset, batch_size=128, sampler=train_sampler,
-            num_workers=1)
+            num_workers=num_workers)
         val_dl = torch.utils.data.DataLoader(
             validset, batch_size=100, sampler=valid_sampler,
-            num_workers=1)
+            num_workers=num_workers)
         return trn_dl, val_dl
 
 def get_svhn_loaders():

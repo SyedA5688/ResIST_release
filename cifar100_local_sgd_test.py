@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,2,1,0"
 
 import torch.nn.functional as functional
 import torch.distributed as dist
@@ -7,17 +7,56 @@ import numpy as np
 import argparse
 import torch
 import time
-import torchvision.transforms as transforms
-from torchvision.datasets.cifar import CIFAR10
-from random import shuffle, choice, seed
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from random import seed  # shuffle, choice,
+from datetime import datetime
 
 from data import (
     get_cifar10_loaders,
     get_cifar100_loaders,
-    get_tin_data,
     get_svhn_loaders,
 )
-from utils import get_demon_momentum, aggregate_resnet_optimizer_statistics
+# import torchvision.transforms as transforms
+# from torchvision.datasets.cifar import CIFAR10
+# from utils import get_demon_momentum, aggregate_resnet_optimizer_statistics
+
+
+def plot_loss_curves(train_losses, test_losses, iter_count, save_path):
+    assert len(train_losses) == len(test_losses) == iter_count, "Unequal sizes in loss curve plotting."
+    time = list(range(iter_count))
+    visual_df = pd.DataFrame({
+        "Train Loss": train_losses,
+        "Test Loss": test_losses,
+        "Iterations": time
+    })
+
+    plt.rcParams.update({'font.size': 16})
+    sns.lineplot(x='Iterations', y='Loss Value', hue='Loss Type',
+                 data=pd.melt(visual_df, ['Iterations'], value_name="Loss Value", var_name="Loss Type"))
+    plt.title("ResIST Loss Curves")
+    plt.yscale("log")
+    plt.savefig(save_path, bbox_inches='tight', facecolor="white")
+    plt.close()
+
+
+def plot_acc_curves(train_accs, test_accs, iter_count, save_path):
+    assert len(test_accs) == iter_count, "Unequal sizes in accuracy curve plotting."
+    time = list(range(iter_count))
+    visual_df = pd.DataFrame({
+        "Train Accuracy": train_accs,
+        "Test Accuracy": test_accs,
+        "Iterations": time
+    })
+
+    plt.rcParams.update({'font.size': 16})
+    sns.lineplot(x='Iterations', y='Accuracy Value', hue='Accuracy Type',
+                 data=pd.melt(visual_df, ['Iterations'], value_name="Accuracy Value", var_name="Accuracy Type"))
+    plt.title("ResIST Acc Curves")
+    plt.savefig(save_path, bbox_inches='tight', facecolor="white")
+    plt.close()
+
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
@@ -58,9 +97,10 @@ class BasicBlock(torch.nn.Module):
         return out
 
 
-
 class PreActBlock(torch.nn.Module):
-    '''Pre-activation version of the BasicBlock.'''
+    """
+    Pre-activation version of the BasicBlock.
+    """
     expansion = 1
 
     def __init__(self, in_planes, planes, stride=1):
@@ -82,6 +122,7 @@ class PreActBlock(torch.nn.Module):
         out = self.conv2(functional.relu(self.bn2(out)))
         out += shortcut
         return out
+
 
 class PreActResNet(torch.nn.Module):
     # taken from https://github.com/kuangliu/pytorch-cifar
@@ -126,8 +167,10 @@ def PreActResNet152(blocks=[3, 4, 36, 3], out_size=512, num_classes=10):
 def PreActResNet200(blocks=[3, 4, 50, 3], out_size=512, num_classes=10):
     return PreActResNet(PreActBlock, blocks, out_size=out_size, num_classes=num_classes)
 
-test_rank=0
-test_total_time=0
+
+test_rank = 0
+test_total_time = 0
+
 def broadcast_module(specs, module:torch.nn.Module):
     group = dist.new_group(list(range(specs['world_size'])))
     for para in module.parameters():
@@ -149,7 +192,8 @@ def reduce_module(specs, args, module:torch.nn.Module):
             para.data = para.data.div_(specs['world_size'])
     dist.destroy_process_group(group)
 
-class DistributedResNetModel():
+
+class DistributedResNetModel:
     def __init__(self, model:PreActResNet):
         self.base_model = model
 
@@ -164,19 +208,19 @@ class DistributedResNetModel():
             broadcast_module(specs, self.base_model.layer3[idx])
     
     def sync_model(self, specs, args):
-        print('running all reduce')
+        # print('running all reduce')
         all_reduce_module(specs, args, self.base_model.conv1)
         all_reduce_module(specs, args, self.base_model.layer1)
         all_reduce_module(specs, args, self.base_model.layer2)
         all_reduce_module(specs, args, self.base_model.layer4)
         all_reduce_module(specs, args, self.base_model.fc)
         all_reduce_module(specs, args, self.base_model.layer3[0])
-        print('finish all reduce')
+        # print('finish all reduce')
 
-        print('running reduce')
+        # print('running reduce')
         for idx in range(1, len(self.base_model.layer3)):
             reduce_module(specs, args, self.base_model.layer3[idx])
-        print('finish reduce')
+        # print('finish reduce')
 
     def ini_sync_dispatch_model(self, specs, args):
         broadcast_module(specs, self.base_model.conv1)
@@ -191,10 +235,9 @@ class DistributedResNetModel():
     def prepare_whole_model(self, specs, args):
         return
 
-def train(
-        specs, args, start_time, model_name, dist_model: DistributedResNetModel,
-        optimizer, device, train_loader, test_loader, epoch, num_sync, num_iter,
-        train_time_log,test_loss_log, test_acc_log):
+def train(specs, args, start_time, model_name, dist_model: DistributedResNetModel,
+          optimizer, device, train_loader, test_loader, epoch, num_sync, num_iter,
+          train_time_log,test_loss_log, test_acc_log, train_loss_log, train_acc_log, expt_save_path):
 
     # employ a step schedule for the sub nets
     lr = specs.get('lr', 1e-2)
@@ -208,14 +251,19 @@ def train(
     print(f'Learning Rate: {lr}')
 
     # training loop
+    agg_train_loss = 0.
+    train_num_correct = 0.
+    total_ex = 0.
+
+    # training loop
     for i, (data, target) in enumerate(train_loader):
         data = data.to(device)
         target = target.to(device)
         if num_iter % specs['repartition_iter'] == 0:
-            if num_iter>0:
-                print('dispatching model')
+            if num_iter > 0:
+                # print('dispatching model')
                 dist_model.dispatch_model(specs, args)
-                print('finish dispatch')
+                # print('finish dispatch')
             optimizer = torch.optim.SGD(
                     dist_model.base_model.parameters(), lr=lr,
                     momentum=specs.get('momentum', 0.9), weight_decay=specs.get('wd', 5e-4))
@@ -223,43 +271,75 @@ def train(
         optimizer.zero_grad()
         output = dist_model.base_model(data)
         loss = functional.cross_entropy(output, target)
+        agg_train_loss += loss.item()
         loss.backward()
         optimizer.step()
         train_pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        train_correct = train_pred.eq(target.view_as(train_pred)).sum().item()
+        total_ex += target.size(0)
+        train_num_correct += train_pred.eq(target.view_as(train_pred)).sum().item()
         if (
                 ((num_iter + 1) % specs['repartition_iter'] == 0) or
                 (i == len(train_loader) - 1 and epoch == specs['epochs'])):
-            print('syncing the model')
+            # print('syncing the model')
             dist_model.sync_model(specs, args)
-            print('finished sync')
+            # print('finished sync')
             num_sync = num_sync+1
             end_time = time.time()
             elapsed_time = end_time - start_time
-            print('Node {}: Train Num sync {} total time {:3.2f}s'.format(args.rank, num_sync, elapsed_time))
+            print('Epoch {}, Iter {}, Rank {}: Train Num sync {} total time {:3.2f}s'.format(epoch, i, args.rank, num_sync, elapsed_time))
             if args.rank == 0:
                 if num_sync == 1:
                     train_time_log[num_sync - 1] = elapsed_time
                 else:
                     train_time_log[num_sync - 1] = train_time_log[num_sync - 2] + elapsed_time
+
+                # Update train loss and accuracy lists
+                temp_train_loss = agg_train_loss if i == 0 else agg_train_loss / i
+                train_acc = train_num_correct / total_ex
+                train_loss_log[num_sync - 1] = temp_train_loss
+                train_acc_log[num_sync - 1] = train_acc
+
                 print('total time {:3.2f}s'.format(train_time_log[num_sync - 1]))
-                print('total broadcast time',test_total_time)
+                # print('total broadcast time', test_total_time)
             
-            print('preparing and testing')
+            # print('preparing and testing')
             dist_model.prepare_whole_model(specs,args)
             test(
                     specs, args, dist_model, device, test_loader,
                     epoch, num_sync, test_loss_log, test_acc_log)
-            print('done testing')
+            # print('done testing')
             if args.rank == 0:
-                np.savetxt('./log/' + model_name + '_train_time.log', train_time_log, fmt='%1.4f', newline=' ')
-                np.savetxt('./log/' + model_name + '_test_loss.log', test_loss_log, fmt='%1.4f', newline=' ')
-                np.savetxt('./log/' + model_name + '_test_acc.log', test_acc_log, fmt='%1.4f', newline=' ')
+                np.savetxt(os.path.join(expt_save_path, '_train_time.log'), train_time_log, fmt='%1.4f', newline=' ')
+                np.savetxt(os.path.join(expt_save_path, '_test_loss.log'), test_loss_log, fmt='%1.4f', newline=' ')
+                np.savetxt(os.path.join(expt_save_path, '_train_loss.log'), train_loss_log, fmt='%1.4f', newline=' ')
+                np.savetxt(os.path.join(expt_save_path, '_test_acc.log'), test_acc_log, fmt='%1.4f', newline=' ')
+                np.savetxt(os.path.join(expt_save_path, '_train_acc.log'), train_acc_log, fmt='%1.4f', newline=' ')
             start_time = time.time()
         num_iter = num_iter + 1
+
+    # save model checkpoint at the end of each epoch
+    if args.rank == 0:
+        np.savetxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name)), train_time_log,
+                   fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name)), test_loss_log, fmt='%1.4f',
+                   newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name)), test_acc_log, fmt='%1.4f',
+                   newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name)), train_loss_log,
+                   fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name)), train_acc_log, fmt='%1.4f',
+                   newline=' ')
+
+        checkpoint = {
+            'model': dist_model.base_model.state_dict(),
+            'epoch': epoch,
+            'num_sync': num_sync,
+            'num_iter': num_iter,
+        }
+        torch.save(checkpoint, os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
     return num_sync, num_iter, start_time, optimizer
 
-def test(specs,args, dist_model: DistributedResNetModel, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log):
+def test(specs, args, dist_model: DistributedResNetModel, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log):
     # Do validation only on prime node in cluster.
     dist_model.prepare_eval()
     dist_model.base_model.eval()
@@ -287,17 +367,17 @@ def test(specs,args, dist_model: DistributedResNetModel, device, test_loader, ep
 
 def main():
     specs = {
-        'test_type': 'ist_resnet', # should be either ist or baseline
-        'model_type': 'preact_resnet', # use to specify type of resnet to use in baseline
+        'test_type': 'ist_resnet',      # should be either ist or baseline
+        'model_type': 'preact_resnet',  # use to specify type of resnet to use in baseline
         'use_valid_set': False,
-        'model_version': 'v1', # only used for the mobilenet tests
+        'model_version': 'v1',          # only used for the mobilenet tests
         'dataset': 'cifar100',
-        'repartition_iter': 50, # number of iterations to perform before re-sampling subnets
+        'repartition_iter': 50,         # number of iterations to perform before re-sampling subnets
         'epochs': 40,
-        'world_size': 4, # number of subnets to use during training
-        'layer_sizes': [3, 4, 23, 3], # used for resnet baseline, number of blocks in each section
+        'world_size': 4,                # number of subnets to use during training
+        'layer_sizes': [3, 4, 23, 3],   # used for resnet baseline, number of blocks in each section
         'expansion': 1.,
-        'lr': .01,
+        'lr': 0.01,
         'momentum': 0.9,
         'wd': 5e-4,
         'log_interval': 5,
@@ -307,7 +387,7 @@ def main():
     # parser.add_argument('--dataset', type=str, default='cifar10')
     parser.add_argument('--dist-backend', type=str, default='nccl', metavar='S',
                         help='backend type for distributed PyTorch')
-    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9912', metavar='S',
+    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9914', metavar='S',
                         help='master ip for distributed PyTorch')
     parser.add_argument('--rank', type=int, default=0, metavar='R',
                         help='rank for distributed PyTorch')
@@ -315,13 +395,15 @@ def main():
                          help='keep model in local update mode for how many iteration (default: 5)')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                          help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=-1, metavar='S',
+    parser.add_argument('--pytorch-seed', type=int, default=3, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
     parser.add_argument('--cuda-id', type=int, default=0, metavar='N',
                         help='cuda index, if the instance has multiple GPUs.')
     parser.add_argument('--model_name', type=str, default='cifar10_local_iter')
+    parser.add_argument('--save-dir', type=str, default='./runs/LocalSGD/', metavar='D',
+                        help='directory where experiment will be saved')
     args = parser.parse_args()
 
     specs['repartition_iter'] = args.repartition_iter
@@ -336,7 +418,7 @@ def main():
     print(args.cuda_id, torch.cuda.device_count())
     if args.use_cuda:
         assert args.cuda_id < torch.cuda.device_count()
-        device = torch.device('cuda',args.cuda_id)
+        device = torch.device('cuda', args.cuda_id)
     else:
         device = torch.device('cpu')
     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -368,22 +450,72 @@ def main():
         raise NotImplementedError(f'{specs["dataset"]} dataset not supported')
 
     model_name = args.model_name
-    dist_model = DistributedResNetModel(
+
+    # Create save directories
+    if args.rank == 0 and not os.path.exists(args.save_dir):
+        os.mkdir(args.save_dir)
+
+    expt_save_path = os.path.join(args.save_dir, datetime.now().strftime('%Y-%m-%d-%H_%M_%S'))
+    if args.rank == 0 and not os.path.exists(expt_save_path):
+        os.mkdir(expt_save_path)
+    # expt_save_path = os.path.join(args.save_dir, "2022-10-14-08_19_32")
+    specs['resume_training_first_epoch'] = False
+
+    if os.path.exists(expt_save_path) and specs['resume_training_first_epoch']:
+        print('Loading model from a checkpoint!')
+        dist_model = DistributedResNetModel(
             model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device))
+        checkpoint = torch.load(os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
+        dist_model.base_model.load_state_dict(checkpoint['model'])
+        dist_model.ini_sync_dispatch_model(specs, args)
+        start_epoch = checkpoint['epoch']
+        num_sync = checkpoint['num_sync']
+        num_iter = checkpoint['num_iter']
+
+        train_time_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name))) if args.rank == 0 else None
+        test_loss_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name))) if args.rank == 0 else None
+        test_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name))) if args.rank == 0 else None
+        train_loss_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name))) if args.rank == 0 else None
+        train_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name))) if args.rank == 0 else None
+        print(f'Starting at epoch {start_epoch}')
+    else:
+        print("Training from scratch!")
+        dist_model = DistributedResNetModel(
+                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device))
+        start_epoch = 0
+        num_sync = 0
+        num_iter = 0
+
+        train_time_log = np.zeros(2000) if args.rank == 0 else None
+        train_loss_log = np.zeros(2000) if args.rank == 0 else None
+        test_loss_log = np.zeros(2000) if args.rank == 0 else None
+        train_acc_log = np.zeros(2000) if args.rank == 0 else None
+        test_acc_log = np.zeros(2000) if args.rank == 0 else None
+
+    print("Running initial sync")
     dist_model.ini_sync_dispatch_model(specs, args)
     epochs = specs['epochs']
-    train_time_log = np.zeros(1000) if args.rank == 0 else None
-    test_loss_log = np.zeros(1000) if args.rank == 0 else None
-    test_acc_log = np.zeros(1000) if args.rank == 0 else None
-    num_sync = 0
-    num_iter = 0
-    optimizer = None 
+    optimizer = torch.optim.SGD(
+                    dist_model.base_model.parameters(), lr=specs.get('lr', 1e-2),
+                    momentum=specs.get('momentum', 0.9), weight_decay=specs.get('wd', 5e-4))
     start_time = time.time()
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch + 1, epochs + 1):
         num_sync, num_iter, start_time, optimizer = train(
                 specs, args, start_time, model_name, dist_model, optimizer, device,
                 trn_dl, test_dl, epoch, num_sync, num_iter, train_time_log, test_loss_log,
-                test_acc_log)
-        
+                test_acc_log, train_loss_log, train_acc_log, expt_save_path)
+
+    if args.rank == 0:
+        # Plot loss and accuracy curves
+        test_loss_log = test_loss_log[:num_sync]
+        test_acc_log = test_acc_log[:num_sync]
+        train_loss_log = train_loss_log[:num_sync]
+        train_acc_log = train_acc_log[:num_sync]
+        plot_loss_curves(train_loss_log, test_loss_log, num_sync,
+                         save_path=os.path.join(expt_save_path, '{}_loss_curves.png'.format(model_name)))
+        plot_acc_curves(train_acc_log, test_acc_log, num_sync,
+                        save_path=os.path.join(expt_save_path, '{}_accuracy_curves.png'.format(model_name)))
+
+
 if __name__ == '__main__':
     main()
