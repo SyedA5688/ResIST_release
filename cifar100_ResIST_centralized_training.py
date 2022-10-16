@@ -622,7 +622,7 @@ def main():
                         help='keep model in local update mode for how many iteration (default: 5)')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                         help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=1, metavar='S',
+    parser.add_argument('--pytorch-seed', type=int, default=10, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
