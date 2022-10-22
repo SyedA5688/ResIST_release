@@ -2,18 +2,12 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
+import time
 import torch.nn.functional as functional
 import torch.distributed as dist
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import argparse
 import torch
-import time
-from datetime import datetime
-# import torchvision.transforms as transforms
-# from torchvision.datasets.cifar import CIFAR10
+from pthflops import count_ops
 from random import shuffle, choice, seed
 
 from data import (
@@ -23,41 +17,6 @@ from data import (
     get_svhn_loaders,
 )
 # from utils import get_demon_momentum, aggregate_resnet_optimizer_statistics
-
-
-def plot_loss_curves(train_losses, test_losses, iter_count, save_path):
-    assert len(train_losses) == len(test_losses) == iter_count, "Unequal sizes in loss curve plotting."
-    time = list(range(iter_count))
-    visual_df = pd.DataFrame({
-        "Train Loss": train_losses,
-        "Test Loss": test_losses,
-        "Iterations": time
-    })
-
-    plt.rcParams.update({'font.size': 16})
-    sns.lineplot(x='Iterations', y='Loss Value', hue='Loss Type',
-                 data=pd.melt(visual_df, ['Iterations'], value_name="Loss Value", var_name="Loss Type"))
-    plt.title("ResIST Loss Curves")
-    plt.yscale("log")
-    plt.savefig(save_path, bbox_inches='tight', facecolor="white")
-    plt.close()
-
-
-def plot_acc_curves(train_accs, test_accs, iter_count, save_path):
-    assert len(test_accs) == iter_count, "Unequal sizes in accuracy curve plotting."
-    time = list(range(iter_count))
-    visual_df = pd.DataFrame({
-        "Train Accuracy": train_accs,
-        "Test Accuracy": test_accs,
-        "Iterations": time
-    })
-
-    plt.rcParams.update({'font.size': 16})
-    sns.lineplot(x='Iterations', y='Accuracy Value', hue='Accuracy Type',
-                 data=pd.melt(visual_df, ['Iterations'], value_name="Accuracy Value", var_name="Accuracy Type"))
-    plt.title("ResIST Acc Curves")
-    plt.savefig(save_path, bbox_inches='tight', facecolor="white")
-    plt.close()
 
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
@@ -351,33 +310,21 @@ class ISTResNetModel():
                                  source=min(current_group))
 
 
-def train(specs, args, start_time, model_name, ist_model: ISTResNetModel, optimizer, device, train_loader, test_loader, epoch, num_sync, num_iter, train_time_log, train_loss_log, train_acc_log, test_loss_log, test_acc_log, expt_save_path):
-
+def train(specs, args, model_name, ist_model: ISTResNetModel, optimizer, device, train_loader, num_iter):
     # employ a step schedule for the sub nets
     lr = specs.get('lr', 1e-2)
-    if epoch > int(specs['epochs']*0.5):
-        lr /= 10
-    if epoch > int(specs['epochs']*0.75):
-        lr /= 10
-    if optimizer is not None:
-        for pg in optimizer.param_groups:
-            pg['lr'] = lr
-    print(f'Learning Rate: {lr}')
-
-    # training loop
-    agg_train_loss = 0.
-    train_num_correct = 0.
-    total_ex = 0.
+    epoch = 0
+    flops_counter = 0
 
     for i, (data, target) in enumerate(train_loader):
-        print("Epoch {}, Iteration {}, Rank {} doing distributed training...".format(epoch, num_iter, args.rank))
+        # print("Epoch {}, Iteration {}, Rank {} doing distributed training...".format(epoch, num_iter, args.rank))
         data = data.to(device)
         target = target.to(device)
         if num_iter % specs['repartition_iter'] == 0 or i == 0:
             if num_iter > 0 and not specs["resume_training_first_epoch"]:
-                print('running model dispatch')
+                # print('running model dispatch')
                 ist_model.dispatch_model(specs, args)
-                print('model dispatch finished')
+                # print('model dispatch finished')
             else:
                 specs["resume_training_first_epoch"] = False
             optimizer = torch.optim.SGD(
@@ -386,88 +333,33 @@ def train(specs, args, start_time, model_name, ist_model: ISTResNetModel, optimi
 
         optimizer.zero_grad()
         output = ist_model.base_model(data)
+
+        # Count FLOPs
+        ops, returned_data = count_ops(ist_model.base_model, data)
+        flops_counter += ops
+
         loss = functional.cross_entropy(output, target)
-        agg_train_loss += loss.item()
         loss.backward()
         optimizer.step()
-        train_pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
-        total_ex += target.size(0)
-        train_num_correct += train_pred.eq(target.view_as(train_pred)).sum().item()
         if (
                 ((num_iter + 1) % specs['repartition_iter'] == 0) or
                 (i == len(train_loader) - 1 and epoch == specs['epochs'])):
-            print('running model sync')
+            # print('running model sync')
             ist_model.sync_model(specs, args)
-            print('model sync finished')
-            num_sync = num_sync + 1
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            print('Node {}: Train Num sync {}, total time {:3.2f}s'.format(args.rank, num_sync, elapsed_time))
-            if args.rank == 0:
-                if num_sync == 1:
-                    train_time_log[num_sync - 1] = elapsed_time
-                else:
-                    train_time_log[num_sync - 1] = train_time_log[num_sync - 2] + elapsed_time
-
-                # Update train loss and accuracy lists
-                temp_train_loss = agg_train_loss if i == 0 else agg_train_loss / i
-                train_acc = train_num_correct / total_ex
-                train_loss_log[num_sync - 1] = temp_train_loss
-                train_acc_log[num_sync - 1] = train_acc
-
-                print('total time {:3.2f}s'.format(train_time_log[num_sync - 1]))
-                print('total broadcast time', test_total_time)
+            # print('model sync finished')
+            # num_sync = num_sync + 1
+            # end_time = time.time()
+            # elapsed_time = end_time - start_time
+            # print('Node {}: Train Num sync {}, total time {:3.2f}s'.format(args.rank, num_sync, elapsed_time))
             
-            print(f'preparing and testing')
+            # print(f'preparing and testing')
             ist_model.prepare_whole_model(specs,args)
-            test(specs,args, ist_model, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log)
-            print('done testing')
-            start_time = time.time()
+            # test(specs,args, ist_model, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log)
+            # print('done testing')
+            # start_time = time.time()
         num_iter = num_iter + 1
 
-    # save model checkpoint at the end of each epoch
-    if args.rank == 0:
-        np.savetxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name)), train_time_log, fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name)), test_loss_log, fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name)), test_acc_log, fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name)), train_loss_log, fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name)), train_acc_log, fmt='%1.4f', newline=' ')
-
-        checkpoint = {
-                'model': ist_model.base_model.state_dict(),
-                'epoch': epoch,
-                'num_sync': num_sync,
-                'num_iter': num_iter,
-        }
-        torch.save(checkpoint, os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
-    return num_sync, num_iter, start_time, optimizer
-
-def test(specs, args, ist_model: ISTResNetModel, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log):
-    # Do validation only on prime node in cluster.
-    if args.rank == 0:
-        ist_model.prepare_eval()
-        ist_model.base_model.eval()
-        agg_val_loss = 0.
-        num_correct = 0.
-        total_ex = 0.
-        criterion = torch.nn.CrossEntropyLoss()
-        for model_in, labels in test_loader:
-            model_in = model_in.to(device)
-            labels = labels.to(device)
-            with torch.no_grad():
-                model_output = ist_model.base_model(model_in)
-                val_loss = criterion(model_output, labels)
-            agg_val_loss += val_loss.item()
-            _, preds = model_output.max(1)
-            total_ex += labels.size(0)
-            num_correct += preds.eq(labels).sum().item()
-        agg_val_loss /= len(test_loader)
-        val_acc = num_correct/total_ex
-        print("Epoch {} Number of Sync {} Local Test Loss: {:.6f}; Test Accuracy: {:.4f}.\n".format(epoch, num_sync, agg_val_loss, val_acc))
-        test_loss_log[num_sync - 1] = agg_val_loss
-        test_acc_log[num_sync - 1] = val_acc
-        ist_model.prepare_train(args) # reset all scale constants
-        ist_model.base_model.train()
+    return flops_counter
 
 
 def main():
@@ -558,68 +450,20 @@ def main():
     # check if model has been checkpointed already
     model_name = args.model_name
 
-    # Create save directories
-    if args.rank == 0 and not os.path.exists(args.save_dir):
-        os.mkdir(args.save_dir)
+    print('Training model from scratch!')
+    ist_model = ISTResNetModel(
+            model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device),
+            num_sites=specs['world_size'], min_blocks_per_site=specs['min_blocks_per_site'])
 
-    expt_save_path = os.path.join(args.save_dir, datetime.now().strftime('%Y-%m-%d-%H_%M_%S'))
-    if args.rank == 0 and not os.path.exists(expt_save_path):
-        os.mkdir(expt_save_path)
-    # expt_save_path = os.path.join(args.save_dir, "2022-10-08-12_16_06")
-    specs['resume_training_first_epoch'] = False
-
-    if os.path.exists(expt_save_path) and specs['resume_training_first_epoch']:
-        print('Loading model from a checkpoint!')
-        ist_model = ISTResNetModel(
-                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device),
-                num_sites=specs['world_size'], min_blocks_per_site=specs['min_blocks_per_site'])
-        checkpoint = torch.load(os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
-        ist_model.base_model.load_state_dict(checkpoint['model'])
-        start_epoch = checkpoint['epoch']
-        num_sync = checkpoint['num_sync']
-        num_iter = checkpoint['num_iter']
-        train_time_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name))) if args.rank == 0 else None
-        test_loss_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name))) if args.rank == 0 else None
-        test_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name))) if args.rank == 0 else None
-        train_loss_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name))) if args.rank == 0 else None
-        train_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name))) if args.rank == 0 else None
-        print(f'Starting at epoch {start_epoch}')
-    else:
-        print('Training model from scratch!')
-        ist_model = ISTResNetModel(
-                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device),
-                num_sites=specs['world_size'], min_blocks_per_site=specs['min_blocks_per_site'])
-        train_time_log = np.zeros(2000) if args.rank == 0 else None
-        test_loss_log = np.zeros(2000) if args.rank == 0 else None
-        test_acc_log = np.zeros(2000) if args.rank == 0 else None
-        train_loss_log = np.zeros(2000) if args.rank == 0 else None
-        train_acc_log = np.zeros(2000) if args.rank == 0 else None
-        start_epoch = 0
-        num_sync = 0
-        num_iter = 0
+    num_iter = 0
 
     print('running initial sync')
     ist_model.ini_sync_dispatch_model(specs, args)
     print('initial sync finished')
-    epochs = specs['epochs']
-    optimizer = None 
-    start_time = time.time()
-    for epoch in range(start_epoch + 1, epochs + 1):
-        num_sync, num_iter, start_time, optimizer = train(
-                specs, args, start_time, model_name, ist_model, optimizer, device,
-                trn_dl, test_dl, epoch, num_sync, num_iter, train_time_log, train_loss_log,
-                train_acc_log, test_loss_log, test_acc_log, expt_save_path)
-
-    if args.rank == 0:
-        # Plot loss and accuracy curves
-        test_loss_log = test_loss_log[:num_sync]
-        test_acc_log = test_acc_log[:num_sync]
-        train_loss_log = train_loss_log[:num_sync]
-        train_acc_log = train_acc_log[:num_sync]
-        plot_loss_curves(train_loss_log, test_loss_log, num_sync,
-                         save_path=os.path.join(expt_save_path, '{}_loss_curves.png'.format(model_name)))
-        plot_acc_curves(train_acc_log, test_acc_log, num_sync,
-                        save_path=os.path.join(expt_save_path, '{}_accuracy_curves.png'.format(model_name)))
+    optimizer = None
+    flops = train(specs, args, model_name, ist_model, optimizer, device, trn_dl, num_iter)
+    time.sleep(5)
+    print("Rank {} worker, {} operations".format(args.rank, flops))
 
 
 if __name__ == '__main__':

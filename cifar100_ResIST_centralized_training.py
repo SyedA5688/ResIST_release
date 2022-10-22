@@ -614,7 +614,7 @@ def main():
     # parser.add_argument('--dataset', type=str, default='cifar10')
     parser.add_argument('--dist-backend', type=str, default='gloo', metavar='S',
                         help='backend type for distributed PyTorch (default: nccl)')
-    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9002', metavar='S',
+    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9001', metavar='S',
                         help='master ip for distributed PyTorch')
     parser.add_argument('--rank', type=int, default=0, metavar='R',
                         help='rank for distributed PyTorch')
@@ -622,7 +622,7 @@ def main():
                         help='keep model in local update mode for how many iteration (default: 5)')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                         help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=10, metavar='S',
+    parser.add_argument('--pytorch-seed', type=int, default=12, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
@@ -633,7 +633,7 @@ def main():
                         help='directory where experiment will be saved')
     parser.add_argument('--central-train-freq', type=int, default=95, metavar='N',
                         help='perform centralized training every X iterations (default: 4)')
-    parser.add_argument('--central-train-iter', type=int, default=5, metavar='N',
+    parser.add_argument('--central-train-iter', type=int, default=1, metavar='N',
                         help='perform centralized training for Y iterations (default: 20)')
     args = parser.parse_args()
 

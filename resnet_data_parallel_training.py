@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import torch.distributed as dist
 from datetime import datetime
 from random import seed
 
@@ -188,7 +189,7 @@ def train(specs, args, start_time, model_name, ddp_model, optimizer, device, tra
     total_ex = 0.
 
     for i, (data, target) in enumerate(train_loader):
-        print("Iteration {}".format(num_iter))
+        # print("Iteration {}".format(num_iter))
         data = data.to(device)
         target = target.to(device)
 
@@ -273,7 +274,7 @@ def test(ddp_model, args, device, test_loader, epoch, num_log, test_loss_log, te
         test_acc_log[num_log - 1] = val_acc
         ddp_model.train()
 
-
+# ToDo: Run distributed ResNet online code, find which of these 3 {LocalSGD, ResNet one GPU, ResNet multi gpu} shows performance gap
 def main():
     specs = {
         'test_type': 'ist_resnet',  # should be either ist or baseline
@@ -281,7 +282,7 @@ def main():
         'use_valid_set': False,
         'model_version': 'v1',  # only used for the mobilenet tests
         'dataset': 'cifar100',
-        'epochs': 200,
+        'epochs': 40,
         'world_size': 4,  # number of subnets to use during training
         'layer_sizes': [3, 4, 23, 3],  # used for resnet baseline, number of blocks in each section
         'log_interval': 50,  # used for resnet baseline, number of blocks in each section
@@ -295,19 +296,19 @@ def main():
     # parser.add_argument('--dataset', type=str, default='cifar10')
     parser.add_argument('--dist-backend', type=str, default='nccl', metavar='S',
                         help='backend type for distributed PyTorch')
-    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9915', metavar='S',
+    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9916', metavar='S',
                         help='master ip for distributed PyTorch')
     parser.add_argument('--rank', type=int, default=0, metavar='R',
                         help='rank for distributed PyTorch')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                         help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=1, metavar='S',
+    parser.add_argument('--pytorch-seed', type=int, default=3, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
     parser.add_argument('--cuda-id', type=int, default=0, metavar='N',
                         help='cuda index, if the instance has multiple GPUs.')
-    parser.add_argument('--model_name', type=str, default='cifar10_local_iter')
+    parser.add_argument('--model_name', type=str, default='data_parallel_resnet')
     parser.add_argument('--save-dir', type=str, default='./runs/ResNet_baseline/', metavar='D',
                         help='directory where experiment will be saved')
     args = parser.parse_args()
@@ -325,6 +326,9 @@ def main():
         device = torch.device('cuda', args.cuda_id)
     else:
         device = torch.device('cpu')
+
+    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                            rank=args.rank, world_size=specs['world_size'])
 
     if specs['dataset'] == 'cifar100':
         out_size = 512
