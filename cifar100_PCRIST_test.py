@@ -1,6 +1,6 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 os.environ["NCCL_DEBUG"] = "INFO"
 
 import torch.nn.functional as functional
@@ -622,18 +622,18 @@ def main():
                         help='keep model in local update mode for how many iteration (default: 5)')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
                         help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=12, metavar='S',
+    parser.add_argument('--pytorch-seed', type=int, default=-1, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
     parser.add_argument('--cuda-id', type=int, default=0, metavar='N',
                         help='cuda index, if the instance has multiple GPUs.')
     parser.add_argument('--model_name', type=str, default='cifar100_local_iter')
-    parser.add_argument('--save-dir', type=str, default='./runs/ResIST_centralized_training/', metavar='D',
+    parser.add_argument('--save-dir', type=str, default='./runs/PCRIST/', metavar='D',
                         help='directory where experiment will be saved')
     parser.add_argument('--central-train-freq', type=int, default=95, metavar='N',
                         help='perform centralized training every X iterations (default: 4)')
-    parser.add_argument('--central-train-iter', type=int, default=1, metavar='N',
+    parser.add_argument('--central-train-iter', type=int, default=2, metavar='N',
                         help='perform centralized training for Y iterations (default: 20)')
     args = parser.parse_args()
 

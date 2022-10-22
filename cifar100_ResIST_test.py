@@ -1,25 +1,27 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,2,1,0"
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 import torch.nn.functional as functional
 import torch.distributed as dist
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import argparse
 import torch
 import time
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-from random import seed  # shuffle, choice,
 from datetime import datetime
+# import torchvision.transforms as transforms
+# from torchvision.datasets.cifar import CIFAR10
+from random import shuffle, choice, seed
 
 from data import (
     get_cifar10_loaders,
     get_cifar100_loaders,
+    get_tin_data,
     get_svhn_loaders,
 )
-# import torchvision.transforms as transforms
-# from torchvision.datasets.cifar import CIFAR10
 # from utils import get_demon_momentum, aggregate_resnet_optimizer_statistics
 
 
@@ -97,14 +99,15 @@ class BasicBlock(torch.nn.Module):
         return out
 
 
+
 class PreActBlock(torch.nn.Module):
-    """
-    Pre-activation version of the BasicBlock.
-    """
+    '''Pre-activation version of the BasicBlock.'''
     expansion = 1
 
     def __init__(self, in_planes, planes, stride=1):
         super(PreActBlock, self).__init__()
+        self.active_flag = True
+        self.scale_constant = 1.0
         self.bn1 = torch.nn.BatchNorm2d(in_planes, affine=True, track_running_stats=False)
         self.conv1 = torch.nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = torch.nn.BatchNorm2d(planes, affine=True, track_running_stats=False)
@@ -116,12 +119,16 @@ class PreActBlock(torch.nn.Module):
             )
 
     def forward(self, x):
-        out = functional.relu(self.bn1(x))
-        shortcut = self.downsample(out) if self.downsample is not None else x
-        out = self.conv1(out)
-        out = self.conv2(functional.relu(self.bn2(out)))
-        out += shortcut
+        if self.active_flag: # Instead of zero out weights, this can also avoid computation.
+            out = functional.relu(self.bn1(x))
+            shortcut = self.downsample(out) if self.downsample is not None else x
+            out = self.conv1(out)
+            out = self.conv2(functional.relu(self.bn2(out)))*self.scale_constant
+            out += shortcut
+        else:
+            out = x
         return out
+
 
 
 class PreActResNet(torch.nn.Module):
@@ -167,77 +174,184 @@ def PreActResNet152(blocks=[3, 4, 36, 3], out_size=512, num_classes=10):
 def PreActResNet200(blocks=[3, 4, 50, 3], out_size=512, num_classes=10):
     return PreActResNet(PreActBlock, blocks, out_size=out_size, num_classes=num_classes)
 
+def sample_block_indices_with_overlap(num_sites, num_blocks, min_blocks_per_site):
+    assert min_blocks_per_site < num_blocks
+    total_blocks = max(num_sites * min_blocks_per_site, num_blocks - 1)
+    full_perm = []
+    while total_blocks > 0.:
+        temp = [i for i in range(num_blocks - 1)]
+        shuffle(temp)
+        full_perm = full_perm + temp
+        total_blocks -= (num_blocks - 1)
+    blocks_per_site = max(int((num_blocks - 1) / num_sites), min_blocks_per_site)
+    subnet_sizes = [blocks_per_site for x in range(num_sites)]
+    remaining_blocks = num_blocks - sum(subnet_sizes) - 1
+    if remaining_blocks > 0:
+        for i in range(remaining_blocks):
+            subnet_sizes[i] += 1
+    start_idx = 0
+    site_indices = []
+    for i in range(num_sites):
+        curr_size = subnet_sizes[i]
+        curr_block = full_perm[start_idx: start_idx + curr_size]
+        curr_block = [val + 1 for val in curr_block]
+        curr_block = list(set(curr_block))
+        assert not 0 in curr_block
+        site_indices.append(curr_block)
+        start_idx += curr_size
+    for site_idx in range(len(site_indices)):
+        while len(site_indices[site_idx]) < min_blocks_per_site:
+            next_idx = choice([i + 1 for i in range(num_blocks - 1)])
+            if not next_idx in site_indices[site_idx]:
+                site_indices[site_idx].append(next_idx)
+    return site_indices
 
-test_rank = 0
-test_total_time = 0
+test_rank=0
+test_total_time=0
+def broadcast_module(module:torch.nn.Module, rank_list=None,source=0):
+    # print("Calling broadcast_module()")
+    if rank_list is None:
+        group = dist.group.WORLD
+    else:
+        group = dist.new_group(rank_list)
+    
 
-def broadcast_module(specs, module:torch.nn.Module):
-    group = dist.new_group(list(range(specs['world_size'])))
     for para in module.parameters():
-        dist.broadcast(para.data, src=0, group=group, async_op=False)
-    dist.destroy_process_group(group)
+        dist.broadcast(para.data, src=source, group=group, async_op=False)
 
-def all_reduce_module(specs, args, module):
+    if rank_list is not None:
+        dist.destroy_process_group(group)
+
+def reduce_module(specs, args, module:torch.nn.Module, rank_list=None):
+    # print("Calling reduce_module()")
+    if rank_list is None:
+        raise 'error'
+    else:
+        group = dist.new_group(rank_list)
+    for para in module.parameters():
+        dist.reduce(para.data, dst=min(rank_list), op=dist.ReduceOp.SUM, group=group)
+        if args.rank == min(rank_list): # compute average
+            if rank_list is None:
+                para.data = para.data.div_(specs['world_size'])
+            else:
+                para.data = para.data.div_(len(rank_list))
+    if rank_list is not None:
+        dist.destroy_process_group(group)
+
+def all_reduce_module(specs, args, module:torch.nn.Module, rank_list=None):
+    # print("Calling all_reduce_module()")
     group = dist.group.WORLD
     for para in module.parameters():
         dist.all_reduce(para.data, op=dist.ReduceOp.SUM, group=group)
-        para.data = para.data.div_(specs['world_size'])
-    
-
-def reduce_module(specs, args, module:torch.nn.Module):
-    group = dist.new_group(list(range(specs['world_size'])))
-    for para in module.parameters():
-        dist.reduce(para.data, dst=0, op=dist.ReduceOp.SUM, group=group)
-        if args.rank == 0: # compute average
+        if rank_list is None:
             para.data = para.data.div_(specs['world_size'])
-    dist.destroy_process_group(group)
+        else:
+            para.data = para.data.div_(len(rank_list))
+    if rank_list is not None:
+        dist.destroy_process_group(group)
 
-
-class DistributedResNetModel:
-    def __init__(self, model:PreActResNet):
+class ISTResNetModel():
+    def __init__(self, model:PreActResNet, num_sites=4, min_blocks_per_site=0):
         self.base_model = model
+        self.min_blocks_per_site = min_blocks_per_site
+        self.num_sites = num_sites
+        self.site_indices = None
+        if min_blocks_per_site == 0:
+            self.scale_constant=1.0/num_sites
+        else:
+            # dropout prob becomes total blocks per site / total blocks in layer3
+            self.scale_constant = max(1.0/num_sites, min_blocks_per_site/22)
+        self.layer_server_list=[]
 
     def prepare_eval(self):
-        return 
- 
+        for i in range(1,self.base_model.num_blocks[2]):
+            self.base_model.layer3[i].active_flag = True
+            self.base_model.layer3[i].scale_constant = self.scale_constant
+
+
     def prepare_train(self, args):
-        return
+        for i in range(1,self.base_model.num_blocks[2]):
+            self.base_model.layer3[i].active_flag = i in self.site_indices[args.rank]
+            self.base_model.layer3[i].scale_constant = 1.0
+
 
     def dispatch_model(self, specs, args):
-        for idx in range(1, len(self.base_model.layer3)):
-            broadcast_module(specs, self.base_model.layer3[idx])
-    
+        self.site_indices = sample_block_indices_with_overlap(num_sites=self.num_sites,
+                                                         num_blocks=self.base_model.num_blocks[2],
+                                                         min_blocks_per_site=self.min_blocks_per_site)
+        print("Calling dispatch_model()!")
+        for i in range(1,self.base_model.num_blocks[2]):
+            current_group = []
+            for site_i in range(self.num_sites):
+                if i in self.site_indices[site_i]:
+                    current_group.append(site_i)
+            if not (self.layer_server_list[i] in current_group):
+                current_group.append(self.layer_server_list[i])
+            broadcast_module(self.base_model.layer3[i], rank_list=current_group,source=self.layer_server_list[i])
+            self.base_model.layer3[i].active_flag = i in self.site_indices[args.rank]
+
     def sync_model(self, specs, args):
-        # print('running all reduce')
+        print("Calling sync_model()!")
+        # aggregate conv1
         all_reduce_module(specs, args, self.base_model.conv1)
+        # aggregate layer 1 & 2 & 4
         all_reduce_module(specs, args, self.base_model.layer1)
         all_reduce_module(specs, args, self.base_model.layer2)
         all_reduce_module(specs, args, self.base_model.layer4)
+        # aggregate FC layer
         all_reduce_module(specs, args, self.base_model.fc)
+        # apply IST aggregation here
         all_reduce_module(specs, args, self.base_model.layer3[0])
-        # print('finish all reduce')
+        self.layer_server_list=[-1]
+        for i in range(1,self.base_model.num_blocks[2]):
 
-        # print('running reduce')
-        for idx in range(1, len(self.base_model.layer3)):
-            reduce_module(specs, args, self.base_model.layer3[idx])
-        # print('finish reduce')
+            current_group = []
+            for site_i in range(self.num_sites):
+                if i in self.site_indices[site_i]:
+                    current_group.append(site_i)
+            self.layer_server_list.append(min(current_group))
+            reduce_module(specs, args, self.base_model.layer3[i], rank_list=current_group)
 
-    def ini_sync_dispatch_model(self, specs, args):
-        broadcast_module(specs, self.base_model.conv1)
-        broadcast_module(specs, self.base_model.layer1)
-        broadcast_module(specs, self.base_model.layer2)
-        broadcast_module(specs, self.base_model.layer4)
-        broadcast_module(specs, self.base_model.fc)
-        broadcast_module(specs, self.base_model.layer3[0])
-        for idx in range(1, len(self.base_model.layer3)):
-            broadcast_module(specs, self.base_model.layer3[idx])
+    def ini_sync_dispatch_model(self,specs,args):
+        # broadcast conv1 
+        broadcast_module(self.base_model.conv1,source=0)
+
+        # # broadcast layer 1 & 2 & 4
+        broadcast_module(self.base_model.layer1,source=0)
+
+        broadcast_module(self.base_model.layer2,source=0)
+
+        broadcast_module(self.base_model.layer4,source=0)
+
+        # # broadcast FC layer
+        broadcast_module(self.base_model.fc,source=0)
+
+        broadcast_module(self.base_model.layer3[0],source=0)
+
+        self.site_indices = sample_block_indices_with_overlap(num_sites=self.num_sites,
+                                                         num_blocks=self.base_model.num_blocks[2],
+                                                         min_blocks_per_site=self.min_blocks_per_site)
+
+        # # apply IST here
+        for i in range(1,self.base_model.num_blocks[2]):
+            broadcast_module(self.base_model.layer3[i],source=0)
+            self.base_model.layer3[i].active_flag = i in self.site_indices[args.rank]
 
     def prepare_whole_model(self, specs, args):
-        return
+        print("Calling prepare_whole_model()!")
+        for i in range(1, self.base_model.num_blocks[2]):
 
-def train(specs, args, start_time, model_name, dist_model: DistributedResNetModel,
-          optimizer, device, train_loader, test_loader, epoch, num_sync, num_iter,
-          train_time_log,test_loss_log, test_acc_log, train_loss_log, train_acc_log, expt_save_path):
+            current_group = []
+            for site_i in range(self.num_sites):
+                if i in self.site_indices[site_i]:
+                    current_group.append(site_i)
+
+            if not (current_group[0] == 0):
+                broadcast_module(self.base_model.layer3[i], rank_list=[0, min(current_group)],
+                                 source=min(current_group))
+
+
+def train(specs, args, start_time, model_name, ist_model: ISTResNetModel, optimizer, device, train_loader, test_loader, epoch, num_sync, num_iter, train_time_log, train_loss_log, train_acc_log, test_loss_log, test_acc_log, expt_save_path):
 
     # employ a step schedule for the sub nets
     lr = specs.get('lr', 1e-2)
@@ -255,21 +369,23 @@ def train(specs, args, start_time, model_name, dist_model: DistributedResNetMode
     train_num_correct = 0.
     total_ex = 0.
 
-    # training loop
     for i, (data, target) in enumerate(train_loader):
+        print("Epoch {}, Iteration {}, Rank {} doing distributed training...".format(epoch, num_iter, args.rank))
         data = data.to(device)
         target = target.to(device)
-        if num_iter % specs['repartition_iter'] == 0:
-            if num_iter > 0:
-                # print('dispatching model')
-                dist_model.dispatch_model(specs, args)
-                # print('finish dispatch')
+        if num_iter % specs['repartition_iter'] == 0 or i == 0:
+            if num_iter > 0 and not specs["resume_training_first_epoch"]:
+                print('running model dispatch')
+                ist_model.dispatch_model(specs, args)
+                print('model dispatch finished')
+            else:
+                specs["resume_training_first_epoch"] = False
             optimizer = torch.optim.SGD(
-                    dist_model.base_model.parameters(), lr=lr,
+                    ist_model.base_model.parameters(), lr=lr,
                     momentum=specs.get('momentum', 0.9), weight_decay=specs.get('wd', 5e-4))
 
         optimizer.zero_grad()
-        output = dist_model.base_model(data)
+        output = ist_model.base_model(data)
         loss = functional.cross_entropy(output, target)
         agg_train_loss += loss.item()
         loss.backward()
@@ -280,13 +396,13 @@ def train(specs, args, start_time, model_name, dist_model: DistributedResNetMode
         if (
                 ((num_iter + 1) % specs['repartition_iter'] == 0) or
                 (i == len(train_loader) - 1 and epoch == specs['epochs'])):
-            # print('syncing the model')
-            dist_model.sync_model(specs, args)
-            # print('finished sync')
-            num_sync = num_sync+1
+            print('running model sync')
+            ist_model.sync_model(specs, args)
+            print('model sync finished')
+            num_sync = num_sync + 1
             end_time = time.time()
             elapsed_time = end_time - start_time
-            print('Epoch {}, Iter {}, Rank {}: Train Num sync {} total time {:3.2f}s'.format(epoch, i, args.rank, num_sync, elapsed_time))
+            print('Node {}: Train Num sync {}, total time {:3.2f}s'.format(args.rank, num_sync, elapsed_time))
             if args.rank == 0:
                 if num_sync == 1:
                     train_time_log[num_sync - 1] = elapsed_time
@@ -300,109 +416,99 @@ def train(specs, args, start_time, model_name, dist_model: DistributedResNetMode
                 train_acc_log[num_sync - 1] = train_acc
 
                 print('total time {:3.2f}s'.format(train_time_log[num_sync - 1]))
-                # print('total broadcast time', test_total_time)
+                print('total broadcast time', test_total_time)
             
-            # print('preparing and testing')
-            dist_model.prepare_whole_model(specs,args)
-            test(
-                    specs, args, dist_model, device, test_loader,
-                    epoch, num_sync, test_loss_log, test_acc_log)
-            # print('done testing')
-            if args.rank == 0:
-                np.savetxt(os.path.join(expt_save_path, '_train_time.log'), train_time_log, fmt='%1.4f', newline=' ')
-                np.savetxt(os.path.join(expt_save_path, '_test_loss.log'), test_loss_log, fmt='%1.4f', newline=' ')
-                np.savetxt(os.path.join(expt_save_path, '_train_loss.log'), train_loss_log, fmt='%1.4f', newline=' ')
-                np.savetxt(os.path.join(expt_save_path, '_test_acc.log'), test_acc_log, fmt='%1.4f', newline=' ')
-                np.savetxt(os.path.join(expt_save_path, '_train_acc.log'), train_acc_log, fmt='%1.4f', newline=' ')
+            print(f'preparing and testing')
+            ist_model.prepare_whole_model(specs,args)
+            test(specs,args, ist_model, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log)
+            print('done testing')
             start_time = time.time()
         num_iter = num_iter + 1
 
     # save model checkpoint at the end of each epoch
     if args.rank == 0:
-        np.savetxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name)), train_time_log,
-                   fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name)), test_loss_log, fmt='%1.4f',
-                   newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name)), test_acc_log, fmt='%1.4f',
-                   newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name)), train_loss_log,
-                   fmt='%1.4f', newline=' ')
-        np.savetxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name)), train_acc_log, fmt='%1.4f',
-                   newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name)), train_time_log, fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name)), test_loss_log, fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name)), test_acc_log, fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_train_loss.log'.format(model_name)), train_loss_log, fmt='%1.4f', newline=' ')
+        np.savetxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name)), train_acc_log, fmt='%1.4f', newline=' ')
 
         checkpoint = {
-            'model': dist_model.base_model.state_dict(),
-            'epoch': epoch,
-            'num_sync': num_sync,
-            'num_iter': num_iter,
+                'model': ist_model.base_model.state_dict(),
+                'epoch': epoch,
+                'num_sync': num_sync,
+                'num_iter': num_iter,
         }
         torch.save(checkpoint, os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
     return num_sync, num_iter, start_time, optimizer
 
-def test(specs, args, dist_model: DistributedResNetModel, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log):
+def test(specs, args, ist_model: ISTResNetModel, device, test_loader, epoch, num_sync, test_loss_log, test_acc_log):
     # Do validation only on prime node in cluster.
-    dist_model.prepare_eval()
-    dist_model.base_model.eval()
-    agg_val_loss = 0.
-    num_correct = 0.
-    total_ex = 0.
-    for model_in, labels in test_loader:
-        model_in = model_in.to(device)
-        labels = labels.to(device)
-        with torch.no_grad():
-            model_output = dist_model.base_model(model_in)
-            val_loss = functional.cross_entropy(model_output, labels)
-        agg_val_loss += val_loss.item()
-        _, preds = model_output.max(1)
-        total_ex += labels.size(0)
-        num_correct += preds.eq(labels).sum().item()
-    agg_val_loss /= len(test_loader)
-    val_acc = num_correct/total_ex
     if args.rank == 0:
+        ist_model.prepare_eval()
+        ist_model.base_model.eval()
+        agg_val_loss = 0.
+        num_correct = 0.
+        total_ex = 0.
+        criterion = torch.nn.CrossEntropyLoss()
+        for model_in, labels in test_loader:
+            model_in = model_in.to(device)
+            labels = labels.to(device)
+            with torch.no_grad():
+                model_output = ist_model.base_model(model_in)
+                val_loss = criterion(model_output, labels)
+            agg_val_loss += val_loss.item()
+            _, preds = model_output.max(1)
+            total_ex += labels.size(0)
+            num_correct += preds.eq(labels).sum().item()
+        agg_val_loss /= len(test_loader)
+        val_acc = num_correct/total_ex
         print("Epoch {} Number of Sync {} Local Test Loss: {:.6f}; Test Accuracy: {:.4f}.\n".format(epoch, num_sync, agg_val_loss, val_acc))
         test_loss_log[num_sync - 1] = agg_val_loss
         test_acc_log[num_sync - 1] = val_acc
-    dist_model.prepare_train(args) # reset all scale constants
-    dist_model.base_model.train()
+        ist_model.prepare_train(args) # reset all scale constants
+        ist_model.base_model.train()
+
 
 def main():
     specs = {
-        'test_type': 'ist_resnet',      # should be either ist or baseline
+        'test_type': 'ist_resnet',  # should be either ist or baseline
         'model_type': 'preact_resnet',  # use to specify type of resnet to use in baseline
         'use_valid_set': False,
-        'model_version': 'v1',          # only used for the mobilenet tests
+        'model_version': 'v1',  # only used for the mobilenet tests
         'dataset': 'cifar100',
-        'repartition_iter': 50,         # number of iterations to perform before re-sampling subnets
-        'epochs': 40,
-        'world_size': 4,                # number of subnets to use during training
-        'layer_sizes': [3, 4, 23, 3],   # used for resnet baseline, number of blocks in each section
+        'repartition_iter': 50,  # number of iterations to perform before re-sampling subnets
+        'epochs': 40,  # 160 epochs in ResIST paper
+        'world_size': 4,  # number of subnets to use during training
+        'layer_sizes': [3, 4, 23, 3],  # used for resnet baseline, number of blocks in each section
         'expansion': 1.,
-        'lr': 0.01,
+        'lr': 0.1,  # .01
         'momentum': 0.9,
         'wd': 5e-4,
         'log_interval': 5,
+        'min_blocks_per_site': 0,  # used for the resnet ist, allow overlapping block partitions to occur
     }
 
     parser = argparse.ArgumentParser(description='PyTorch ResNet (IST distributed)')
     # parser.add_argument('--dataset', type=str, default='cifar10')
     parser.add_argument('--dist-backend', type=str, default='nccl', metavar='S',
                         help='backend type for distributed PyTorch')
-    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9914', metavar='S',
+    parser.add_argument('--dist-url', type=str, default='tcp://127.0.0.1:9001', metavar='S',
                         help='master ip for distributed PyTorch')
     parser.add_argument('--rank', type=int, default=0, metavar='R',
                         help='rank for distributed PyTorch')
     parser.add_argument('--repartition_iter', type=int, default=50, metavar='N',
-                         help='keep model in local update mode for how many iteration (default: 5)')
+                        help='keep model in local update mode for how many iteration (default: 5)')
     parser.add_argument('--lr', type=float, default=0.1, metavar='LR',
-                         help='learning rate (default: 1.0 for BN)')
-    parser.add_argument('--pytorch-seed', type=int, default=3, metavar='S',
+                        help='learning rate (default: 1.0 for BN)')
+    parser.add_argument('--pytorch-seed', type=int, default=-1, metavar='S',
                         help='random seed (default: -1)')
     parser.add_argument('--use-cuda', default=True, type=lambda x: (str(x).lower() == 'true'),
                         help='if this is set to True, will use cuda to train')
     parser.add_argument('--cuda-id', type=int, default=0, metavar='N',
                         help='cuda index, if the instance has multiple GPUs.')
     parser.add_argument('--model_name', type=str, default='cifar10_local_iter')
-    parser.add_argument('--save-dir', type=str, default='./runs/LocalSGD/', metavar='D',
+    parser.add_argument('--save-dir', type=str, default='./runs/ResIST/', metavar='D',
                         help='directory where experiment will be saved')
     args = parser.parse_args()
 
@@ -413,12 +519,12 @@ def main():
         torch.manual_seed(args.rank)
         seed(0)
     else:
-        torch.manual_seed(args.pytorch_seed*args.rank)
-        seed(args.pytorch_seed)  # This makes sure, node use the same random key so that they does not need to sync partition info.
-    print(args.cuda_id, torch.cuda.device_count())
+        torch.manual_seed(args.rank*args.pytorch_seed)
+        seed(args.pytorch_seed)
+    #seed(0)  # This makes sure, node use the same random key so that they does not need to sync partition info.
     if args.use_cuda:
         assert args.cuda_id < torch.cuda.device_count()
-        device = torch.device('cuda', args.cuda_id)
+        device = torch.device('cuda',args.cuda_id)
     else:
         device = torch.device('cpu')
     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -449,6 +555,7 @@ def main():
     else:
         raise NotImplementedError(f'{specs["dataset"]} dataset not supported')
 
+    # check if model has been checkpointed already
     model_name = args.model_name
 
     # Create save directories
@@ -458,20 +565,19 @@ def main():
     expt_save_path = os.path.join(args.save_dir, datetime.now().strftime('%Y-%m-%d-%H_%M_%S'))
     if args.rank == 0 and not os.path.exists(expt_save_path):
         os.mkdir(expt_save_path)
-    # expt_save_path = os.path.join(args.save_dir, "2022-10-14-08_19_32")
+    # expt_save_path = os.path.join(args.save_dir, "2022-10-08-12_16_06")
     specs['resume_training_first_epoch'] = False
 
     if os.path.exists(expt_save_path) and specs['resume_training_first_epoch']:
         print('Loading model from a checkpoint!')
-        dist_model = DistributedResNetModel(
-            model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device))
+        ist_model = ISTResNetModel(
+                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device),
+                num_sites=specs['world_size'], min_blocks_per_site=specs['min_blocks_per_site'])
         checkpoint = torch.load(os.path.join(expt_save_path, '{}_model.pth'.format(model_name)))
-        dist_model.base_model.load_state_dict(checkpoint['model'])
-        dist_model.ini_sync_dispatch_model(specs, args)
+        ist_model.base_model.load_state_dict(checkpoint['model'])
         start_epoch = checkpoint['epoch']
         num_sync = checkpoint['num_sync']
         num_iter = checkpoint['num_iter']
-
         train_time_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_time.log'.format(model_name))) if args.rank == 0 else None
         test_loss_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_loss.log'.format(model_name))) if args.rank == 0 else None
         test_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_test_acc.log'.format(model_name))) if args.rank == 0 else None
@@ -479,31 +585,30 @@ def main():
         train_acc_log = np.loadtxt(os.path.join(expt_save_path, '{}_train_acc.log'.format(model_name))) if args.rank == 0 else None
         print(f'Starting at epoch {start_epoch}')
     else:
-        print("Training from scratch!")
-        dist_model = DistributedResNetModel(
-                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device))
+        print('Training model from scratch!')
+        ist_model = ISTResNetModel(
+                model=PreActResNet101(out_size=out_size, num_classes=num_classes).to(device),
+                num_sites=specs['world_size'], min_blocks_per_site=specs['min_blocks_per_site'])
+        train_time_log = np.zeros(2000) if args.rank == 0 else None
+        test_loss_log = np.zeros(2000) if args.rank == 0 else None
+        test_acc_log = np.zeros(2000) if args.rank == 0 else None
+        train_loss_log = np.zeros(2000) if args.rank == 0 else None
+        train_acc_log = np.zeros(2000) if args.rank == 0 else None
         start_epoch = 0
         num_sync = 0
         num_iter = 0
 
-        train_time_log = np.zeros(2000) if args.rank == 0 else None
-        train_loss_log = np.zeros(2000) if args.rank == 0 else None
-        test_loss_log = np.zeros(2000) if args.rank == 0 else None
-        train_acc_log = np.zeros(2000) if args.rank == 0 else None
-        test_acc_log = np.zeros(2000) if args.rank == 0 else None
-
-    print("Running initial sync")
-    dist_model.ini_sync_dispatch_model(specs, args)
+    print('running initial sync')
+    ist_model.ini_sync_dispatch_model(specs, args)
+    print('initial sync finished')
     epochs = specs['epochs']
-    optimizer = torch.optim.SGD(
-                    dist_model.base_model.parameters(), lr=specs.get('lr', 1e-2),
-                    momentum=specs.get('momentum', 0.9), weight_decay=specs.get('wd', 5e-4))
+    optimizer = None 
     start_time = time.time()
     for epoch in range(start_epoch + 1, epochs + 1):
         num_sync, num_iter, start_time, optimizer = train(
-                specs, args, start_time, model_name, dist_model, optimizer, device,
-                trn_dl, test_dl, epoch, num_sync, num_iter, train_time_log, test_loss_log,
-                test_acc_log, train_loss_log, train_acc_log, expt_save_path)
+                specs, args, start_time, model_name, ist_model, optimizer, device,
+                trn_dl, test_dl, epoch, num_sync, num_iter, train_time_log, train_loss_log,
+                train_acc_log, test_loss_log, test_acc_log, expt_save_path)
 
     if args.rank == 0:
         # Plot loss and accuracy curves
