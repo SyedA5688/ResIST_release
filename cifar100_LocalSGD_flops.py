@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,2,1,0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
 import time
 import torch.nn.functional as functional
