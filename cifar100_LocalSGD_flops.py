@@ -263,7 +263,7 @@ def main():
         'model_type': 'preact_resnet',  # use to specify type of resnet to use in baseline
         'use_valid_set': False,
         'model_version': 'v1',          # only used for the mobilenet tests
-        'dataset': 'cifar100',
+        'dataset': 'cifar10',
         'repartition_iter': 50,         # number of iterations to perform before re-sampling subnets
         'epochs': 40,
         'world_size': 4,                # number of subnets to use during training
@@ -324,20 +324,20 @@ def main():
         input_size = 32
         trn_dl, test_dl = get_cifar10_loaders(specs.get('use_valid_set', False))
         criterion = torch.nn.CrossEntropyLoss()
-    elif specs['dataset'] == 'cifar100':
-        out_size = 512
-        for_cifar = True
-        num_classes = 100
-        input_size = 32
-        trn_dl, test_dl = get_cifar100_loaders(specs.get('use_valid_set', False))
-        criterion = torch.nn.CrossEntropyLoss()
-    elif specs['dataset'] == 'svhn':
-        for_cifar = True # size of data is the same
-        num_classes = 10
-        input_size = 32
-        out_size = 512
-        trn_dl, test_dl = get_svhn_loaders()
-        criterion = torch.nn.CrossEntropyLoss()
+    # elif specs['dataset'] == 'cifar100':
+    #     out_size = 512
+    #     for_cifar = True
+    #     num_classes = 100
+    #     input_size = 32
+    #     trn_dl, test_dl = get_cifar100_loaders(specs.get('use_valid_set', False))
+    #     criterion = torch.nn.CrossEntropyLoss()
+    # elif specs['dataset'] == 'svhn':
+    #     for_cifar = True # size of data is the same
+    #     num_classes = 10
+    #     input_size = 32
+    #     out_size = 512
+    #     trn_dl, test_dl = get_svhn_loaders()
+    #     criterion = torch.nn.CrossEntropyLoss()
     else:
         raise NotImplementedError(f'{specs["dataset"]} dataset not supported')
 

@@ -2,7 +2,7 @@
 local_iter=50
 for lr in 3e-2 
 do
-    for trial in {4, 5, 6}
+    for trial in 4
     do
         # freeze when calling the second script so you only run one test at a time
         echo "Starting test: LR="$lr "local_iter=" $local_iter "trial=" $trial
